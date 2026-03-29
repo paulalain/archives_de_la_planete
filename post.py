@@ -5,9 +5,7 @@ Posts a historical photo every day with a description and geolocation.
 
 import os
 import sys
-import json
 import time
-import random
 import hashlib
 import requests
 from datetime import date, datetime
@@ -15,14 +13,15 @@ from datetime import date, datetime
 
 # ─── CONFIG ──────────────────────────────────────────────────────────────────
 
-API_RECORDS = (
-    "https://opendata.hauts-de-seine.fr/api/explore/v2.1/catalog/datasets/"
-    "archives-de-la-planete/records"
-)
+API_BASE    = "https://opendata.hauts-de-seine.fr/api/explore/v2.1/catalog/datasets/archives-de-la-planete"
+API_RECORDS = f"{API_BASE}/records"
 
-IG_USER_ID     = os.environ["IG_USER_ID"]       # Numeric ID of the Instagram Business account
-IG_ACCESS_TOKEN = os.environ["IG_ACCESS_TOKEN"] # Meta long-lived access token
-GRAPH_URL      = "https://graph.facebook.com/v21.0"
+IG_USER_ID      = os.environ["IG_USER_ID"]       # Numeric ID of the Instagram Business account
+IG_ACCESS_TOKEN = os.environ["IG_ACCESS_TOKEN"]  # Meta long-lived access token
+GRAPH_URL       = "https://graph.facebook.com/v21.0"
+
+# Candidate geo field names — probed at startup to find the real one
+GEO_FIELD_CANDIDATES = ["geo_point_2d", "localisation_gps", "geolocalisation", "geopoint", "geo"]
 
 HASHTAGS = (
     "#archivesdelaplanete #albertkahn #autochrome #histoirephotographie "
@@ -43,26 +42,65 @@ def daily_seed() -> int:
     return int(hashlib.md5(today.encode()).hexdigest(), 16) % (10 ** 9)
 
 
+# ─── STEP 0: discover the real geo field name ────────────────────────────────
+
+def discover_geo_field() -> str | None:
+    """
+    Fetches one record with no filter and inspects the returned fields to find
+    which geo field name the dataset actually uses.
+    Falls back to trying each candidate in a filtered query if needed.
+    """
+    log("Discovering geo field name…")
+
+    # First, grab one unrestricted record and check what fields exist
+    r = requests.get(API_RECORDS, params={"limit": 1}, timeout=30)
+    r.raise_for_status()
+    sample = r.json().get("results", [{}])[0]
+    log(f"Dataset fields: {list(sample.keys())}")
+
+    for candidate in GEO_FIELD_CANDIDATES:
+        if candidate in sample:
+            log(f"Geo field found in schema: '{candidate}'")
+            return candidate
+
+    # If none matched by name, try each candidate in a WHERE clause
+    # — catches renamed or aliased fields not obvious from a single record
+    for candidate in GEO_FIELD_CANDIDATES:
+        try:
+            r = requests.get(
+                API_RECORDS,
+                params={"where": f"{candidate} is not null", "limit": 1},
+                timeout=30,
+            )
+            if r.status_code == 200 and r.json().get("results"):
+                log(f"Geo field confirmed via query: '{candidate}'")
+                return candidate
+        except Exception:
+            continue
+
+    log("⚠️  No geo field found — will fetch records without geo filter.")
+    return None
+
+
 # ─── STEP 1: fetch an image from the API ────────────────────────────────────
 
-def fetch_record() -> dict:
+def fetch_record(geo_field: str | None) -> dict:
     """
-    Fetches a random record that has:
-    - an available image ('vignette' or 'image' field)
-    - a geolocation
-    - a description (title or caption)
+    Fetches a random record for today. If a geo field was discovered,
+    restricts results to geolocated records only.
     """
     seed = daily_seed()
     params = {
-        "where": "geo_point_2d is not null",
         "order_by": f"random({seed})",
         "limit": 1,
     }
+    if geo_field:
+        params["where"] = f"{geo_field} is not null"
+
     log(f"Calling API with seed={seed}…")
     r = requests.get(API_RECORDS, params=params, timeout=30)
     r.raise_for_status()
-    data = r.json()
-    results = data.get("results", [])
+    results = r.json().get("results", [])
     if not results:
         raise ValueError("No records returned by the API.")
     return results[0]
@@ -70,7 +108,8 @@ def fetch_record() -> dict:
 
 def extract_image_url(record: dict) -> str:
     """Extracts the public image URL from known dataset fields."""
-    fields = record.get("fields", record)  # v2.1 returns fields at the root level
+    # v2.1 returns fields at the root level (no nested 'fields' key)
+    fields = record.get("fields", record)
 
     # Search through common dataset field names
     for key in ("vignette", "image", "photo", "fichier"):
@@ -92,14 +131,19 @@ def extract_image_url(record: dict) -> str:
     raise ValueError(f"Could not find image URL. Available fields: {list(fields.keys())}")
 
 
-def extract_geo(record: dict) -> tuple[float, float] | None:
-    """Returns (lat, lon) or None."""
+def extract_geo(record: dict, geo_field: str | None) -> tuple[float, float] | None:
+    """Returns (lat, lon) from the discovered geo field, or None."""
+    if not geo_field:
+        return None
     fields = record.get("fields", record)
-    geo = fields.get("geo_point_2d")
+    geo = fields.get(geo_field)
     if not geo:
         return None
     if isinstance(geo, dict):
-        return geo.get("lat"), geo.get("lon")
+        # Common shapes: {"lat": x, "lon": y} or {"latitude": x, "longitude": y}
+        lat = geo.get("lat") or geo.get("latitude")
+        lon = geo.get("lon") or geo.get("longitude")
+        return (lat, lon) if lat and lon else None
     if isinstance(geo, list) and len(geo) == 2:
         return geo[0], geo[1]
     return None
@@ -109,11 +153,11 @@ def build_caption(record: dict) -> str:
     """Builds the Instagram caption in French."""
     fields = record.get("fields", record)
 
-    titre      = fields.get("titre") or fields.get("title") or ""
-    pays       = fields.get("pays") or fields.get("country") or fields.get("localisation") or ""
-    date_prise = fields.get("date_de_prise_de_vue") or fields.get("date") or fields.get("annee") or ""
-    operateur  = fields.get("operateur") or fields.get("photographe") or ""
-    technique  = fields.get("technique") or fields.get("procede") or ""
+    titre       = fields.get("titre") or fields.get("title") or ""
+    pays        = fields.get("pays") or fields.get("country") or fields.get("localisation") or ""
+    date_prise  = fields.get("date_de_prise_de_vue") or fields.get("date") or fields.get("annee") or ""
+    operateur   = fields.get("operateur") or fields.get("photographe") or ""
+    technique   = fields.get("technique") or fields.get("procede") or ""
     description = fields.get("description") or fields.get("legende") or fields.get("caption") or ""
 
     parts = []
@@ -197,15 +241,18 @@ def publish_container(creation_id: str) -> str:
 def main():
     log("=== Archives de la Planète Bot — starting ===")
 
+    # 0. Discover the real geo field name (avoids hardcoding assumptions)
+    geo_field = discover_geo_field()
+
     # 1. Fetch today's record
-    record = fetch_record()
+    record = fetch_record(geo_field)
     log(f"Record fetched. Fields: {list(record.keys())}")
 
     # 2. Extract the required data
     image_url = extract_image_url(record)
     log(f"Image URL: {image_url}")
 
-    geo = extract_geo(record)
+    geo = extract_geo(record, geo_field)
     if geo:
         log(f"Geolocation: lat={geo[0]}, lon={geo[1]}")
     else:
