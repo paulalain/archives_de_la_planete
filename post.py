@@ -20,9 +20,6 @@ IG_USER_ID      = os.environ["IG_USER_ID"]       # Numeric ID of the Instagram B
 IG_ACCESS_TOKEN = os.environ["IG_ACCESS_TOKEN"]  # Meta long-lived access token
 GRAPH_URL       = "https://graph.facebook.com/v21.0"
 
-# Candidate geo field names — probed at startup to find the real one
-GEO_FIELD_CANDIDATES = ["geo_point_2d", "localisation_gps", "geolocalisation", "geopoint", "geo"]
-
 HASHTAGS = (
     "#archivesdelaplanete #albertkahn #autochrome #histoirephotographie "
     "#patrimoine #photographiehistorique #couleurancienne #memoriedumonde "
@@ -42,61 +39,20 @@ def daily_seed() -> int:
     return int(hashlib.md5(today.encode()).hexdigest(), 16) % (10 ** 9)
 
 
-# ─── STEP 0: discover the real geo field name ────────────────────────────────
-
-def discover_geo_field() -> str | None:
-    """
-    Fetches one record with no filter and inspects the returned fields to find
-    which geo field name the dataset actually uses.
-    Falls back to trying each candidate in a filtered query if needed.
-    """
-    log("Discovering geo field name…")
-
-    # First, grab one unrestricted record and check what fields exist
-    r = requests.get(API_RECORDS, params={"limit": 1}, timeout=30)
-    r.raise_for_status()
-    sample = r.json().get("results", [{}])[0]
-    log(f"Dataset fields: {list(sample.keys())}")
-
-    for candidate in GEO_FIELD_CANDIDATES:
-        if candidate in sample:
-            log(f"Geo field found in schema: '{candidate}'")
-            return candidate
-
-    # If none matched by name, try each candidate in a WHERE clause
-    # — catches renamed or aliased fields not obvious from a single record
-    for candidate in GEO_FIELD_CANDIDATES:
-        try:
-            r = requests.get(
-                API_RECORDS,
-                params={"where": f"{candidate} is not null", "limit": 1},
-                timeout=30,
-            )
-            if r.status_code == 200 and r.json().get("results"):
-                log(f"Geo field confirmed via query: '{candidate}'")
-                return candidate
-        except Exception:
-            continue
-
-    log("⚠️  No geo field found — will fetch records without geo filter.")
-    return None
-
-
 # ─── STEP 1: fetch an image from the API ────────────────────────────────────
 
-def fetch_record(geo_field: str | None) -> dict:
+def fetch_record() -> dict:
     """
-    Fetches a random record for today. If a geo field was discovered,
-    restricts results to geolocated records only.
+    Fetches a random geolocated record with an available image.
+    Filters on geo_point (the confirmed field name) and photo_ftp (image field).
+    Uses a date-based random seed so the same image is picked if re-run today.
     """
     seed = daily_seed()
     params = {
+        "where": "geo_point is not null and photo_ftp is not null",
         "order_by": f"random({seed})",
         "limit": 1,
     }
-    if geo_field:
-        params["where"] = f"{geo_field} is not null"
-
     log(f"Calling API with seed={seed}…")
     r = requests.get(API_RECORDS, params=params, timeout=30)
     r.raise_for_status()
@@ -107,40 +63,44 @@ def fetch_record(geo_field: str | None) -> dict:
 
 
 def extract_image_url(record: dict) -> str:
-    """Extracts the public image URL from known dataset fields."""
-    # v2.1 returns fields at the root level (no nested 'fields' key)
-    fields = record.get("fields", record)
+    """
+    Extracts the public image URL from the photo_ftp field.
+    photo_ftp can be a string URL, a dict with a 'url' key,
+    or a list of such dicts (Opendatasoft attachment format).
+    """
+    val = record.get("photo_ftp")
+    if not val:
+        raise ValueError(f"No photo_ftp field in record. Available fields: {list(record.keys())}")
 
-    # Search through common dataset field names
-    for key in ("vignette", "image", "photo", "fichier"):
-        val = fields.get(key)
-        if not val:
-            continue
-        # Opendatasoft sometimes returns a list of dicts with a "url" key
-        if isinstance(val, list) and val and isinstance(val[0], dict):
-            url = val[0].get("url") or val[0].get("download_url")
+    if isinstance(val, str) and val.startswith("http"):
+        return val
+
+    if isinstance(val, dict):
+        url = val.get("url") or val.get("download_url")
+        if url:
+            return url if url.startswith("http") else "https://opendata.hauts-de-seine.fr" + url
+
+    if isinstance(val, list) and val:
+        first = val[0]
+        if isinstance(first, dict):
+            url = first.get("url") or first.get("download_url")
             if url:
                 return url if url.startswith("http") else "https://opendata.hauts-de-seine.fr" + url
-        if isinstance(val, dict):
-            url = val.get("url") or val.get("download_url")
-            if url:
-                return url if url.startswith("http") else "https://opendata.hauts-de-seine.fr" + url
-        if isinstance(val, str) and val.startswith("http"):
-            return val
+        if isinstance(first, str) and first.startswith("http"):
+            return first
 
-    raise ValueError(f"Could not find image URL. Available fields: {list(fields.keys())}")
+    raise ValueError(f"Could not parse image URL from photo_ftp value: {val!r}")
 
 
-def extract_geo(record: dict, geo_field: str | None) -> tuple[float, float] | None:
-    """Returns (lat, lon) from the discovered geo field, or None."""
-    if not geo_field:
-        return None
-    fields = record.get("fields", record)
-    geo = fields.get(geo_field)
+def extract_geo(record: dict) -> tuple[float, float] | None:
+    """
+    Returns (lat, lon) from the geo_point field, or None.
+    Handles dict shapes {"lat": x, "lon": y} and list shape [lat, lon].
+    """
+    geo = record.get("geo_point")
     if not geo:
         return None
     if isinstance(geo, dict):
-        # Common shapes: {"lat": x, "lon": y} or {"latitude": x, "longitude": y}
         lat = geo.get("lat") or geo.get("latitude")
         lon = geo.get("lon") or geo.get("longitude")
         return (lat, lon) if lat and lon else None
@@ -150,15 +110,16 @@ def extract_geo(record: dict, geo_field: str | None) -> tuple[float, float] | No
 
 
 def build_caption(record: dict) -> str:
-    """Builds the Instagram caption in French."""
-    fields = record.get("fields", record)
-
-    titre       = fields.get("titre") or fields.get("title") or ""
-    pays        = fields.get("pays") or fields.get("country") or fields.get("localisation") or ""
-    date_prise  = fields.get("date_de_prise_de_vue") or fields.get("date") or fields.get("annee") or ""
-    operateur   = fields.get("operateur") or fields.get("photographe") or ""
-    technique   = fields.get("technique") or fields.get("procede") or ""
-    description = fields.get("description") or fields.get("legende") or fields.get("caption") or ""
+    """Builds the Instagram caption in French using the confirmed field names."""
+    titre       = record.get("legende_originale_titre") or record.get("legende_revisee") or ""
+    description = record.get("legende_revisee") or ""
+    pays        = record.get("pays") or record.get("lieu_actuel") or record.get("lieu") or ""
+    date_prise  = record.get("date_de_prise_de_vue") or ""
+    operateur   = record.get("operateur") or ""
+    technique   = record.get("procede_technique") or ""
+    themes      = record.get("themes") or ""
+    ville       = record.get("ville") or ""
+    region      = record.get("region") or ""
 
     parts = []
 
@@ -166,20 +127,26 @@ def build_caption(record: dict) -> str:
     if titre:
         parts.append(f"📸 {titre}")
 
-    # Description if available and different from title
+    # Revised caption if different from title
     if description and description != titre:
         parts.append(f"\n{description}")
 
     # Contextual metadata
     meta = []
-    if pays:
-        meta.append(f"📍 {pays}")
+    location_parts = [v for v in [ville, region, pays] if v]
+    if location_parts:
+        meta.append(f"📍 {', '.join(location_parts)}")
     if date_prise:
         meta.append(f"🗓 {date_prise}")
     if operateur:
         meta.append(f"👤 Opérateur : {operateur}")
     if technique:
         meta.append(f"🎨 Technique : {technique}")
+    if themes:
+        # themes may be a list or a comma-separated string
+        if isinstance(themes, list):
+            themes = ", ".join(themes)
+        meta.append(f"🏷 {themes}")
     if meta:
         parts.append("\n" + "\n".join(meta))
 
@@ -194,7 +161,13 @@ def build_caption(record: dict) -> str:
     # Hashtags
     parts.append(f"\n{HASHTAGS}")
 
-    return "\n".join(parts)
+    caption = "\n".join(parts)
+
+    # Instagram accepts a maximum of 2200 characters
+    if len(caption) > 2200:
+        caption = caption[:2197] + "…"
+
+    return caption
 
 
 # ─── STEP 2: post to Instagram via the Graph API ────────────────────────────
@@ -241,31 +214,25 @@ def publish_container(creation_id: str) -> str:
 def main():
     log("=== Archives de la Planète Bot — starting ===")
 
-    # 0. Discover the real geo field name (avoids hardcoding assumptions)
-    geo_field = discover_geo_field()
+    # 1. Fetch today's record (filtered on geo_point + photo_ftp)
+    record = fetch_record()
+    log(f"Record fetched: {record.get('identifiant_fakir', '?')} — {record.get('legende_originale_titre', '')}")
 
-    # 1. Fetch today's record
-    record = fetch_record(geo_field)
-    log(f"Record fetched. Fields: {list(record.keys())}")
-
-    # 2. Extract the required data
+    # 2. Extract image URL and geolocation
     image_url = extract_image_url(record)
     log(f"Image URL: {image_url}")
 
-    geo = extract_geo(record, geo_field)
+    geo = extract_geo(record)
     if geo:
         log(f"Geolocation: lat={geo[0]}, lon={geo[1]}")
     else:
-        log("⚠️  No geolocation available for this record.")
+        log("⚠️  No geolocation for this record.")
 
+    # 3. Build caption
     caption = build_caption(record)
-    log(f"Caption ({len(caption)} chars):\n{caption[:200]}…")
+    log(f"Caption ({len(caption)} chars):\n{caption[:300]}…")
 
-    # Instagram accepts a maximum of 2200 characters
-    if len(caption) > 2200:
-        caption = caption[:2197] + "…"
-
-    # 3. Post to Instagram (2-step process)
+    # 4. Post to Instagram (2-step process)
     creation_id = create_container(image_url, caption)
     time.sleep(5)  # Recommended delay by Meta before publishing
     media_id = publish_container(creation_id)
