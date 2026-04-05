@@ -209,6 +209,43 @@ def publish_container(creation_id: str) -> str:
     return media_id
 
 
+def create_story_container(image_url: str) -> str:
+    """Creates a Story media container and returns the creation_id."""
+    url = f"{GRAPH_URL}/{IG_USER_ID}/media"
+    payload = {
+        "image_url": image_url,
+        "media_type": "STORIES",
+        "access_token": IG_ACCESS_TOKEN,
+    }
+    log("Creating Instagram Story container…")
+    r = requests.post(url, data=payload, timeout=30)
+    body = r.json()
+    if "error" in body:
+        raise RuntimeError(f"Graph API error (story container): {body['error']}")
+    creation_id = body.get("id")
+    if not creation_id:
+        raise RuntimeError(f"No creation_id in story response: {body}")
+    log(f"Story container created: {creation_id}")
+    return creation_id
+
+
+def publish_story(creation_id: str) -> str:
+    """Publishes the Story container and returns the media_id."""
+    url = f"{GRAPH_URL}/{IG_USER_ID}/media_publish"
+    payload = {
+        "creation_id": creation_id,
+        "access_token": IG_ACCESS_TOKEN,
+    }
+    log("Publishing Story…")
+    r = requests.post(url, data=payload, timeout=30)
+    body = r.json()
+    if "error" in body:
+        raise RuntimeError(f"Graph API error (story publish): {body['error']}")
+    media_id = body.get("id")
+    log(f"✅ Story published successfully! media_id={media_id}")
+    return media_id
+
+
 # ─── MAIN ────────────────────────────────────────────────────────────────────
 
 def main():
@@ -237,7 +274,12 @@ def main():
     time.sleep(5)  # Recommended delay by Meta before publishing
     media_id = publish_container(creation_id)
 
-    log(f"=== Done. Instagram post ID: {media_id} ===")
+    # 4. Share as a Story
+    story_creation_id = create_story_container(image_url)
+    time.sleep(5)
+    story_media_id = publish_story(story_creation_id)
+
+    log(f"=== Done. Post ID: {media_id} — Story ID: {story_media_id} ===")
 
 
 if __name__ == "__main__":
