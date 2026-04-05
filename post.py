@@ -3,12 +3,14 @@ Instagram Bot — Archives de la Planète
 Posts a historical photo every day with a description and geolocation.
 """
 
+import io
 import os
 import sys
 import time
 import hashlib
 import requests
 from datetime import date, datetime
+from PIL import Image
 
 
 # ─── CONFIG ──────────────────────────────────────────────────────────────────
@@ -209,11 +211,48 @@ def publish_container(creation_id: str) -> str:
     return media_id
 
 
+def prepare_story_image(image_url: str) -> str:
+    """
+    Returns a story-ready image URL (9:16 ratio).
+    If the source image is landscape, adds black letterbox bars and re-uploads.
+    If already portrait, returns the original URL unchanged.
+    """
+    r = requests.get(image_url, timeout=30)
+    r.raise_for_status()
+    img = Image.open(io.BytesIO(r.content)).convert("RGB")
+    w, h = img.size
+
+    if w / h <= 9 / 16:
+        log(f"Image is portrait ({w}x{h}), no letterbox needed.")
+        return image_url
+
+    log(f"Image is landscape ({w}x{h}), adding letterbox…")
+    target_h = round(w * 16 / 9)
+    canvas = Image.new("RGB", (w, target_h), (0, 0, 0))
+    canvas.paste(img, (0, (target_h - h) // 2))
+
+    buf = io.BytesIO()
+    canvas.save(buf, format="JPEG", quality=90)
+    buf.seek(0)
+
+    log("Uploading letterboxed image…")
+    resp = requests.post(
+        "https://0x0.st",
+        files={"file": ("story.jpg", buf, "image/jpeg")},
+        timeout=60,
+    )
+    resp.raise_for_status()
+    temp_url = resp.text.strip()
+    log(f"Letterboxed image URL: {temp_url}")
+    return temp_url
+
+
 def create_story_container(image_url: str) -> str:
     """Creates a Story media container from an image URL, returns the creation_id."""
+    story_image_url = prepare_story_image(image_url)
     url = f"{GRAPH_URL}/{IG_USER_ID}/media"
     payload = {
-        "image_url": image_url,
+        "image_url": story_image_url,
         "media_type": "STORIES",
         "link_sticker": '{"link_url":"https://www.instagram.com/archives_de_la_planete/"}',
         "access_token": IG_ACCESS_TOKEN,
