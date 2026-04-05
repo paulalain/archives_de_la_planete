@@ -209,12 +209,13 @@ def publish_container(creation_id: str) -> str:
     return media_id
 
 
-def create_story_container(post_media_id: str) -> str:
-    """Creates a Story container that reshares a feed post, returns the creation_id."""
+def create_story_container(image_url: str) -> str:
+    """Creates a Story media container from an image URL, returns the creation_id."""
     url = f"{GRAPH_URL}/{IG_USER_ID}/media"
     payload = {
+        "image_url": image_url,
         "media_type": "STORIES",
-        "source_media_id": post_media_id,
+        "link_sticker": '{"link_url":"https://www.instagram.com/archives_de_la_planete/"}',
         "access_token": IG_ACCESS_TOKEN,
     }
     log("Creating Instagram Story container…")
@@ -274,8 +275,8 @@ def main():
     time.sleep(5)  # Recommended delay by Meta before publishing
     media_id = publish_container(creation_id)
 
-    # 5. Share as a Story (reshares the published post)
-    story_creation_id = create_story_container(media_id)
+    # 5. Share the same image as a Story
+    story_creation_id = create_story_container(image_url)
     time.sleep(5)
     story_media_id = publish_story(story_creation_id)
 
