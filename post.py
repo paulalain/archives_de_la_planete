@@ -20,6 +20,10 @@ IG_USER_ID      = os.environ["IG_USER_ID"]       # Numeric ID of the Instagram B
 IG_ACCESS_TOKEN = os.environ["IG_ACCESS_TOKEN"]  # Meta long-lived access token
 GRAPH_URL       = "https://graph.facebook.com/v21.0"
 
+GITHUB_TOKEN    = os.environ["GITHUB_TOKEN"]     # Provided automatically by GitHub Actions
+GITHUB_REPO     = "paulalain/archives_de_la_planete"
+GITHUB_API      = "https://api.github.com"
+
 HASHTAGS = (
     "#archivesdelaplanete #albertkahn #autochrome #histoirephotographie "
     "#patrimoine #photographiehistorique #couleurancienne #memoriedumonde "
@@ -179,6 +183,56 @@ def build_caption(record: dict) -> str:
     return caption
 
 
+# ─── IMAGE REHOSTING via GitHub Releases ─────────────────────────────────────
+
+def rehost_image(source_url: str) -> str:
+    """
+    Downloads the image and uploads it as a GitHub Release asset.
+    Returns a public URL with a .jpg extension that Meta can fetch.
+    GitHub Actions provides GITHUB_TOKEN automatically — no extra secrets needed.
+    """
+    today = date.today().isoformat()
+    tag = f"daily-image-{today}"
+    headers = {
+        "Authorization": f"Bearer {GITHUB_TOKEN}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+
+    # Reuse the release if it already exists (e.g. script re-run today)
+    r = requests.get(f"{GITHUB_API}/repos/{GITHUB_REPO}/releases/tags/{tag}", headers=headers, timeout=15)
+    if r.status_code == 200:
+        release_id = r.json()["id"]
+        log(f"Reusing existing GitHub release {tag} (id={release_id})")
+    else:
+        log(f"Creating GitHub release {tag}…")
+        body = requests.post(
+            f"{GITHUB_API}/repos/{GITHUB_REPO}/releases",
+            headers=headers,
+            json={"tag_name": tag, "name": tag, "body": "Daily image for Instagram post."},
+            timeout=15,
+        )
+        body.raise_for_status()
+        release_id = body.json()["id"]
+
+    log("Downloading source image…")
+    img_r = requests.get(source_url, timeout=30)
+    img_r.raise_for_status()
+
+    log("Uploading image to GitHub Release…")
+    upload_url = f"https://uploads.github.com/repos/{GITHUB_REPO}/releases/{release_id}/assets?name=photo.jpg"
+    up = requests.post(
+        upload_url,
+        headers={**headers, "Content-Type": "image/jpeg"},
+        data=img_r.content,
+        timeout=60,
+    )
+    up.raise_for_status()
+    public_url = up.json()["browser_download_url"]
+    log(f"Image hosted at: {public_url}")
+    return public_url
+
+
 # ─── STEP 2: post to Instagram via the Graph API ────────────────────────────
 
 def create_container(image_url: str, caption: str) -> str:
@@ -265,9 +319,10 @@ def main():
     record = fetch_record()
     log(f"Record fetched: {record.get('identifiant_fakir', '?')} — {record.get('legende_originale_titre', '')}")
 
-    # 2. Extract image URL (with .jpg suffix appended so Meta can infer media type)
+    # 2. Extract image URL and rehost on GitHub Releases so Meta can fetch it
     image_url = extract_image_url(record)
-    log(f"Image URL: {image_url}")
+    log(f"Source image URL: {image_url}")
+    image_url = rehost_image(image_url)
 
     geo = extract_geo(record)
     if geo:
