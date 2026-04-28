@@ -1,0 +1,36 @@
+name: 📸 Archives de la Planète — Daily Post
+
+on:
+  schedule:
+    # Every day at 9am Paris time (= 8am UTC in winter, 7am UTC in summer)
+    # We use 8am UTC to target ~9–10am Paris time year-round
+    - cron: '0 8 * * *'
+
+  # Also allows manual triggering from the Actions tab
+  workflow_dispatch:
+
+jobs:
+  post:
+    name: Post today's photo
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write  # Required to create releases and upload assets
+
+    steps:
+      - name: 📂 Checkout repository
+        uses: actions/checkout@v4
+
+      - name: 🐍 Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: 📦 Install dependencies
+        run: pip install requests
+
+      - name: 🚀 Run the bot
+        env:
+          IG_USER_ID: ${{ secrets.IG_USER_ID }}
+          IG_ACCESS_TOKEN: ${{ secrets.IG_ACCESS_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: python post.py
