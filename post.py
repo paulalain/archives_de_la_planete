@@ -72,22 +72,31 @@ def extract_image_url(record: dict) -> str:
     if not val:
         raise ValueError(f"No photo_ftp field in record. Available fields: {list(record.keys())}")
 
+    def normalise(url: str) -> str:
+        if not url.startswith("http"):
+            url = "https://opendata.hauts-de-seine.fr" + url
+        # Append /photo.jpg so Meta can infer the media type from the extension.
+        # Opendatasoft file endpoints ignore trailing path segments after the hash.
+        if not url.lower().endswith((".jpg", ".jpeg", ".png", ".webp")):
+            url = url.rstrip("/") + "/photo.jpg"
+        return url
+
     if isinstance(val, str) and val.startswith("http"):
-        return val
+        return normalise(val)
 
     if isinstance(val, dict):
         url = val.get("url") or val.get("download_url")
         if url:
-            return url if url.startswith("http") else "https://opendata.hauts-de-seine.fr" + url
+            return normalise(url)
 
     if isinstance(val, list) and val:
         first = val[0]
         if isinstance(first, dict):
             url = first.get("url") or first.get("download_url")
             if url:
-                return url if url.startswith("http") else "https://opendata.hauts-de-seine.fr" + url
+                return normalise(url)
         if isinstance(first, str) and first.startswith("http"):
-            return first
+            return normalise(first)
 
     raise ValueError(f"Could not parse image URL from photo_ftp value: {val!r}")
 
@@ -256,7 +265,7 @@ def main():
     record = fetch_record()
     log(f"Record fetched: {record.get('identifiant_fakir', '?')} — {record.get('legende_originale_titre', '')}")
 
-    # 2. Extract image URL and geolocation
+    # 2. Extract image URL (with .jpg suffix appended so Meta can infer media type)
     image_url = extract_image_url(record)
     log(f"Image URL: {image_url}")
 
